@@ -5,18 +5,26 @@ import { getContractReadOnly, getContractWithSigner } from "./components/useCont
 import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
+import { ethers } from 'ethers';
 
 interface SecureFormData {
   id: string;
   title: string;
-  description: string;
-  encryptedValue: number;
+  encryptedValue: string;
   publicValue1: number;
   publicValue2: number;
-  creator: string;
+  description: string;
   timestamp: number;
-  isVerified: boolean;
-  decryptedValue: number;
+  creator: string;
+  isVerified?: boolean;
+  decryptedValue?: number;
+}
+
+interface FormStats {
+  totalSubmissions: number;
+  verifiedCount: number;
+  avgValue: number;
+  recentActivity: number;
 }
 
 const App: React.FC = () => {
@@ -31,11 +39,15 @@ const App: React.FC = () => {
     status: "pending", 
     message: "" 
   });
-  const [newFormData, setNewFormData] = useState({ title: "", description: "", value: "" });
+  const [newFormData, setNewFormData] = useState({ title: "", value: "", description: "" });
   const [selectedForm, setSelectedForm] = useState<SecureFormData | null>(null);
+  const [decryptedValue, setDecryptedValue] = useState<number | null>(null);
+  const [isDecrypting, setIsDecrypting] = useState(false);
+  const [contractAddress, setContractAddress] = useState("");
+  const [fhevmInitializing, setFhevmInitializing] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
-  const [faqVisible, setFaqVisible] = useState(false);
+  const [stats, setStats] = useState<FormStats>({ totalSubmissions: 0, verifiedCount: 0, avgValue: 0, recentActivity: 0 });
   const formsPerPage = 5;
 
   const { status, initialize, isInitialized } = useFhevm();
@@ -44,35 +56,38 @@ const App: React.FC = () => {
 
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
-      if (!isConnected || isInitialized) return;
+      if (!isConnected) return;
+      if (isInitialized || fhevmInitializing) return;
       
       try {
-        console.log('Initializing FHEVM...');
+        setFhevmInitializing(true);
         await initialize();
-        console.log('FHEVM initialized successfully');
       } catch (error) {
-        console.error('Failed to initialize FHEVM:', error);
         setTransactionStatus({ 
           visible: true, 
           status: "error", 
           message: "FHEVM initialization failed" 
         });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
+      } finally {
+        setFhevmInitializing(false);
       }
     };
 
     initFhevmAfterConnection();
-  }, [isConnected, isInitialized, initialize]);
+  }, [isConnected, isInitialized, initialize, fhevmInitializing]);
 
   useEffect(() => {
-    const loadData = async () => {
+    const loadDataAndContract = async () => {
       if (!isConnected) {
         setLoading(false);
         return;
       }
       
       try {
-        await loadForms();
+        await loadData();
+        const contract = await getContractReadOnly();
+        if (contract) setContractAddress(await contract.getAddress());
       } catch (error) {
         console.error('Failed to load data:', error);
       } finally {
@@ -80,10 +95,10 @@ const App: React.FC = () => {
       }
     };
 
-    loadData();
+    loadDataAndContract();
   }, [isConnected]);
 
-  const loadForms = async () => {
+  const loadData = async () => {
     if (!isConnected) return;
     
     setIsRefreshing(true);
@@ -100,12 +115,12 @@ const App: React.FC = () => {
           formsList.push({
             id: businessId,
             title: businessData.name,
-            description: businessData.description,
-            encryptedValue: 0,
+            encryptedValue: businessId,
             publicValue1: Number(businessData.publicValue1) || 0,
             publicValue2: Number(businessData.publicValue2) || 0,
-            creator: businessData.creator,
+            description: businessData.description,
             timestamp: Number(businessData.timestamp),
+            creator: businessData.creator,
             isVerified: businessData.isVerified,
             decryptedValue: Number(businessData.decryptedValue) || 0
           });
@@ -115,12 +130,26 @@ const App: React.FC = () => {
       }
       
       setForms(formsList);
+      calculateStats(formsList);
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
       setIsRefreshing(false); 
     }
+  };
+
+  const calculateStats = (formsData: SecureFormData[]) => {
+    const totalSubmissions = formsData.length;
+    const verifiedCount = formsData.filter(f => f.isVerified).length;
+    const avgValue = formsData.length > 0 
+      ? formsData.reduce((sum, f) => sum + f.publicValue1, 0) / formsData.length 
+      : 0;
+    const recentActivity = formsData.filter(f => 
+      Date.now()/1000 - f.timestamp < 60 * 60 * 24
+    ).length;
+
+    setStats({ totalSubmissions, verifiedCount, avgValue, recentActivity });
   };
 
   const createForm = async () => {
@@ -140,33 +169,33 @@ const App: React.FC = () => {
       const formValue = parseInt(newFormData.value) || 0;
       const businessId = `form-${Date.now()}`;
       
-      const encryptedResult = await encrypt(await contract.getAddress(), address, formValue);
+      const encryptedResult = await encrypt(contractAddress, address, formValue);
       
       const tx = await contract.createBusinessData(
         businessId,
         newFormData.title,
         encryptedResult.encryptedData,
         encryptedResult.proof,
-        Math.floor(Math.random() * 100),
-        Math.floor(Math.random() * 50),
+        Math.floor(Math.random() * 100) + 1,
+        0,
         newFormData.description
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
       await tx.wait();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Secure form created!" });
+      setTransactionStatus({ visible: true, status: "success", message: "Secure form created successfully!" });
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
       
-      await loadForms();
+      await loadData();
       setShowCreateModal(false);
-      setNewFormData({ title: "", description: "", value: "" });
+      setNewFormData({ title: "", value: "", description: "" });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
-        ? "Transaction rejected" 
-        : "Creation failed: " + (e.message || "Unknown error");
+        ? "Transaction rejected by user" 
+        : "Submission failed: " + (e.message || "Unknown error");
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
@@ -181,6 +210,7 @@ const App: React.FC = () => {
       return null; 
     }
     
+    setIsDecrypting(true);
     try {
       const contractRead = await getContractReadOnly();
       if (!contractRead) return null;
@@ -188,7 +218,7 @@ const App: React.FC = () => {
       const businessData = await contractRead.getBusinessData(businessId);
       if (businessData.isVerified) {
         const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "Data already verified" });
+        setTransactionStatus({ visible: true, status: "success", message: "Data already verified on-chain" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
         return storedValue;
       }
@@ -200,18 +230,18 @@ const App: React.FC = () => {
       
       const result = await verifyDecryption(
         [encryptedValueHandle],
-        await contractWrite.getAddress(),
+        contractAddress,
         (abiEncodedClearValues: string, decryptionProof: string) => 
           contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption on-chain..." });
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
-      await loadForms();
+      await loadData();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted successfully!" });
+      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted and verified successfully!" });
       setTimeout(() => {
         setTransactionStatus({ visible: false, status: "pending", message: "" });
       }, 2000);
@@ -220,15 +250,17 @@ const App: React.FC = () => {
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified" });
+        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified on-chain" });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
-        await loadForms();
+        await loadData();
         return null;
       }
       
-      setTransactionStatus({ status: "error", message: "Decryption failed: " + (e.message || "Unknown error"), visible: true });
+      setTransactionStatus({ visible: true, status: "error", message: "Decryption failed: " + (e.message || "Unknown error") });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
+    } finally { 
+      setIsDecrypting(false); 
     }
   };
 
@@ -237,11 +269,11 @@ const App: React.FC = () => {
       const contract = await getContractReadOnly();
       if (!contract) return;
       
-      const available = await contract.isAvailable();
-      setTransactionStatus({ visible: true, status: "success", message: "Contract is available!" });
+      const isAvailable = await contract.isAvailable();
+      setTransactionStatus({ visible: true, status: "success", message: "Contract is available and ready!" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Availability check failed" });
+      setTransactionStatus({ visible: true, status: "error", message: "Contract check failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     }
   };
@@ -251,9 +283,7 @@ const App: React.FC = () => {
     form.description.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const indexOfLastForm = currentPage * formsPerPage;
-  const indexOfFirstForm = indexOfLastForm - formsPerPage;
-  const currentForms = filteredForms.slice(indexOfFirstForm, indexOfLastForm);
+  const paginatedForms = filteredForms.slice((currentPage - 1) * formsPerPage, currentPage * formsPerPage);
   const totalPages = Math.ceil(filteredForms.length / formsPerPage);
 
   if (!isConnected) {
@@ -261,29 +291,46 @@ const App: React.FC = () => {
       <div className="app-container">
         <header className="app-header">
           <div className="logo">
-            <h1>🔐 Secure Form FHE</h1>
+            <h1>FHE Secure Form 🔐</h1>
           </div>
           <div className="header-actions">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            <div className="wallet-connect-wrapper">
+              <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            </div>
           </div>
         </header>
         
         <div className="connection-prompt">
           <div className="connection-content">
-            <div className="connection-icon">🔒</div>
-            <h2>Connect Your Wallet</h2>
-            <p>Connect your wallet to access the FHE-based secure form system</p>
+            <div className="connection-icon">🔐</div>
+            <h2>Connect Your Wallet to Access Secure Forms</h2>
+            <p>Please connect your wallet to initialize the encrypted form system and access secure data collection.</p>
+            <div className="connection-steps">
+              <div className="step">
+                <span>1</span>
+                <p>Connect your wallet using the button above</p>
+              </div>
+              <div className="step">
+                <span>2</span>
+                <p>FHE system will automatically initialize</p>
+              </div>
+              <div className="step">
+                <span>3</span>
+                <p>Start creating and analyzing encrypted forms</p>
+              </div>
+            </div>
           </div>
         </div>
       </div>
     );
   }
 
-  if (!isInitialized) {
+  if (!isInitialized || fhevmInitializing) {
     return (
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
-        <p>Initializing FHE System...</p>
+        <p>Initializing FHE Encryption System...</p>
+        <p>Status: {fhevmInitializing ? "Initializing FHEVM" : status}</p>
       </div>
     );
   }
@@ -291,7 +338,7 @@ const App: React.FC = () => {
   if (loading) return (
     <div className="loading-screen">
       <div className="fhe-spinner"></div>
-      <p>Loading secure forms...</p>
+      <p>Loading secure form system...</p>
     </div>
   );
 
@@ -299,95 +346,103 @@ const App: React.FC = () => {
     <div className="app-container">
       <header className="app-header">
         <div className="logo">
-          <h1>🔐 Secure Form FHE</h1>
-          <span>Fully Homomorphic Encryption Forms</span>
+          <h1>FHE Secure Form 🔐</h1>
+          <p>Privacy-Preserving Data Collection</p>
         </div>
         
         <div className="header-actions">
-          <button onClick={checkAvailability} className="availability-btn">
-            Check Availability
+          <button onClick={checkAvailability} className="check-btn">
+            Check Contract
           </button>
           <button onClick={() => setShowCreateModal(true)} className="create-btn">
-            + New Form
+            + New Secure Form
           </button>
-          <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          <div className="wallet-connect-wrapper">
+            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          </div>
         </div>
       </header>
       
       <div className="main-content">
+        <div className="stats-grid">
+          <div className="stat-card">
+            <div className="stat-icon">📊</div>
+            <div className="stat-content">
+              <h3>Total Submissions</h3>
+              <div className="stat-value">{stats.totalSubmissions}</div>
+            </div>
+          </div>
+          
+          <div className="stat-card">
+            <div className="stat-icon">✅</div>
+            <div className="stat-content">
+              <h3>Verified Data</h3>
+              <div className="stat-value">{stats.verifiedCount}</div>
+            </div>
+          </div>
+          
+          <div className="stat-card">
+            <div className="stat-icon">📈</div>
+            <div className="stat-content">
+              <h3>Average Value</h3>
+              <div className="stat-value">{stats.avgValue.toFixed(1)}</div>
+            </div>
+          </div>
+          
+          <div className="stat-card">
+            <div className="stat-icon">🕒</div>
+            <div className="stat-content">
+              <h3>24h Activity</h3>
+              <div className="stat-value">{stats.recentActivity}</div>
+            </div>
+          </div>
+        </div>
+
         <div className="search-section">
-          <div className="search-bar">
-            <input
-              type="text"
-              placeholder="Search forms..."
+          <div className="search-box">
+            <input 
+              type="text" 
+              placeholder="Search forms..." 
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
+              className="search-input"
             />
+            <span className="search-icon">🔍</span>
           </div>
-          <button onClick={() => setFaqVisible(!faqVisible)} className="faq-btn">
-            {faqVisible ? "Close FAQ" : "View FAQ"}
+          <button onClick={loadData} className="refresh-btn" disabled={isRefreshing}>
+            {isRefreshing ? "Refreshing..." : "Refresh Data"}
           </button>
         </div>
 
-        {faqVisible && (
-          <div className="faq-section">
-            <h3>Frequently Asked Questions</h3>
-            <div className="faq-item">
-              <strong>What is FHE?</strong>
-              <p>Fully Homomorphic Encryption allows computations on encrypted data without decryption.</p>
-            </div>
-            <div className="faq-item">
-              <strong>How is data secured?</strong>
-              <p>All sensitive data is encrypted using Zama FHE before being stored on-chain.</p>
-            </div>
-            <div className="faq-item">
-              <strong>Can I decrypt the data?</strong>
-              <p>Only with proper authorization and through the verification process.</p>
-            </div>
-          </div>
-        )}
-
-        <div className="stats-section">
-          <div className="stat-card">
-            <h3>Total Forms</h3>
-            <div className="stat-value">{forms.length}</div>
-          </div>
-          <div className="stat-card">
-            <h3>Verified Data</h3>
-            <div className="stat-value">{forms.filter(f => f.isVerified).length}</div>
-          </div>
-          <div className="stat-card">
-            <h3>Active Pages</h3>
-            <div className="stat-value">{totalPages}</div>
-          </div>
-        </div>
-
         <div className="forms-section">
-          <div className="section-header">
-            <h2>Secure Forms</h2>
-            <button onClick={loadForms} className="refresh-btn" disabled={isRefreshing}>
-              {isRefreshing ? "Refreshing..." : "Refresh"}
-            </button>
-          </div>
+          <h2>Secure Form Submissions</h2>
           
           <div className="forms-list">
-            {currentForms.length === 0 ? (
+            {paginatedForms.length === 0 ? (
               <div className="no-forms">
                 <p>No secure forms found</p>
-                <button onClick={() => setShowCreateModal(true)} className="create-btn">
+                <button className="create-btn" onClick={() => setShowCreateModal(true)}>
                   Create First Form
                 </button>
               </div>
-            ) : currentForms.map((form, index) => (
-              <div className="form-item" key={index} onClick={() => setSelectedForm(form)}>
-                <div className="form-title">{form.title}</div>
-                <div className="form-description">{form.description}</div>
-                <div className="form-meta">
-                  <span>Created: {new Date(form.timestamp * 1000).toLocaleDateString()}</span>
-                  <span className={`status ${form.isVerified ? 'verified' : 'encrypted'}`}>
-                    {form.isVerified ? '✅ Verified' : '🔒 Encrypted'}
+            ) : paginatedForms.map((form, index) => (
+              <div 
+                className={`form-item ${selectedForm?.id === form.id ? "selected" : ""} ${form.isVerified ? "verified" : ""}`} 
+                key={index}
+                onClick={() => setSelectedForm(form)}
+              >
+                <div className="form-header">
+                  <h3>{form.title}</h3>
+                  <span className={`status-badge ${form.isVerified ? "verified" : "pending"}`}>
+                    {form.isVerified ? "✅ Verified" : "🔓 Pending"}
                   </span>
                 </div>
+                <p className="form-description">{form.description}</p>
+                <div className="form-meta">
+                  <span>Public Value: {form.publicValue1}</span>
+                  <span>Created: {new Date(form.timestamp * 1000).toLocaleDateString()}</span>
+                </div>
+                <div className="form-creator">By: {form.creator.substring(0, 6)}...{form.creator.substring(38)}</div>
               </div>
             ))}
           </div>
@@ -395,15 +450,17 @@ const App: React.FC = () => {
           {totalPages > 1 && (
             <div className="pagination">
               <button 
-                onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                onClick={() => setCurrentPage(prev => Math.max(prev - 1, 1))}
                 disabled={currentPage === 1}
+                className="page-btn"
               >
                 Previous
               </button>
-              <span>Page {currentPage} of {totalPages}</span>
+              <span className="page-info">Page {currentPage} of {totalPages}</span>
               <button 
-                onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                onClick={() => setCurrentPage(prev => Math.min(prev + 1, totalPages))}
                 disabled={currentPage === totalPages}
+                className="page-btn"
               >
                 Next
               </button>
@@ -426,8 +483,13 @@ const App: React.FC = () => {
       {selectedForm && (
         <FormDetailModal 
           form={selectedForm} 
-          onClose={() => setSelectedForm(null)} 
-          isDecrypting={fheIsDecrypting} 
+          onClose={() => { 
+            setSelectedForm(null); 
+            setDecryptedValue(null); 
+          }} 
+          decryptedValue={decryptedValue} 
+          setDecryptedValue={setDecryptedValue} 
+          isDecrypting={isDecrypting || fheIsDecrypting} 
           decryptData={() => decryptData(selectedForm.id)}
         />
       )}
@@ -476,8 +538,8 @@ const ModalCreateForm: React.FC<{
         
         <div className="modal-body">
           <div className="fhe-notice">
-            <strong>FHE Encryption</strong>
-            <p>Sensitive data will be encrypted using Zama FHE technology</p>
+            <strong>FHE 🔐 Encryption Active</strong>
+            <p>Sensitive data will be encrypted with Zama FHE (Integer only)</p>
           </div>
           
           <div className="form-group">
@@ -492,7 +554,21 @@ const ModalCreateForm: React.FC<{
           </div>
           
           <div className="form-group">
-            <label>Description</label>
+            <label>Sensitive Value (Integer only) *</label>
+            <input 
+              type="number" 
+              name="value" 
+              value={formData.value} 
+              onChange={handleChange} 
+              placeholder="Enter sensitive value..." 
+              step="1"
+              min="0"
+            />
+            <div className="data-type-label">FHE Encrypted Integer</div>
+          </div>
+          
+          <div className="form-group">
+            <label>Description *</label>
             <textarea 
               name="description" 
               value={formData.description} 
@@ -501,30 +577,16 @@ const ModalCreateForm: React.FC<{
               rows={3}
             />
           </div>
-          
-          <div className="form-group">
-            <label>Encrypted Value (Integer only) *</label>
-            <input 
-              type="number" 
-              name="value" 
-              value={formData.value} 
-              onChange={handleChange} 
-              placeholder="Enter value to encrypt..." 
-              step="1"
-              min="0"
-            />
-            <div className="data-type-label">FHE Encrypted Integer</div>
-          </div>
         </div>
         
         <div className="modal-footer">
           <button onClick={onClose} className="cancel-btn">Cancel</button>
           <button 
             onClick={onSubmit} 
-            disabled={creating || isEncrypting || !formData.title || !formData.value} 
+            disabled={creating || isEncrypting || !formData.title || !formData.value || !formData.description} 
             className="submit-btn"
           >
-            {creating || isEncrypting ? "Encrypting..." : "Create Secure Form"}
+            {creating || isEncrypting ? "Encrypting and Creating..." : "Create Secure Form"}
           </button>
         </div>
       </div>
@@ -535,19 +597,21 @@ const ModalCreateForm: React.FC<{
 const FormDetailModal: React.FC<{
   form: SecureFormData;
   onClose: () => void;
+  decryptedValue: number | null;
+  setDecryptedValue: (value: number | null) => void;
   isDecrypting: boolean;
   decryptData: () => Promise<number | null>;
-}> = ({ form, onClose, isDecrypting, decryptData }) => {
-  const [decryptedValue, setDecryptedValue] = useState<number | null>(null);
-
+}> = ({ form, onClose, decryptedValue, setDecryptedValue, isDecrypting, decryptData }) => {
   const handleDecrypt = async () => {
-    if (form.isVerified) {
-      setDecryptedValue(form.decryptedValue);
-      return;
+    if (decryptedValue !== null) { 
+      setDecryptedValue(null); 
+      return; 
     }
     
-    const value = await decryptData();
-    setDecryptedValue(value);
+    const decrypted = await decryptData();
+    if (decrypted !== null) {
+      setDecryptedValue(decrypted);
+    }
   };
 
   return (
@@ -565,16 +629,20 @@ const FormDetailModal: React.FC<{
               <strong>{form.title}</strong>
             </div>
             <div className="info-item">
-              <span>Description:</span>
-              <strong>{form.description}</strong>
-            </div>
-            <div className="info-item">
               <span>Creator:</span>
               <strong>{form.creator.substring(0, 6)}...{form.creator.substring(38)}</strong>
             </div>
             <div className="info-item">
-              <span>Created:</span>
+              <span>Date Created:</span>
               <strong>{new Date(form.timestamp * 1000).toLocaleDateString()}</strong>
+            </div>
+            <div className="info-item">
+              <span>Public Value:</span>
+              <strong>{form.publicValue1}</strong>
+            </div>
+            <div className="info-item">
+              <span>Description:</span>
+              <p>{form.description}</p>
             </div>
           </div>
           
@@ -582,11 +650,13 @@ const FormDetailModal: React.FC<{
             <h3>Encrypted Data</h3>
             
             <div className="data-row">
-              <div className="data-label">Encrypted Value:</div>
+              <div className="data-label">Sensitive Value:</div>
               <div className="data-value">
-                {form.isVerified || decryptedValue !== null ? 
-                  `${form.isVerified ? form.decryptedValue : decryptedValue} (Decrypted)` : 
-                  "🔒 Encrypted (FHE Protected)"
+                {form.isVerified && form.decryptedValue ? 
+                  `${form.decryptedValue} (On-chain Verified)` : 
+                  decryptedValue !== null ? 
+                  `${decryptedValue} (Locally Decrypted)` : 
+                  "🔒 FHE Encrypted Integer"
                 }
               </div>
               <button 
@@ -594,28 +664,64 @@ const FormDetailModal: React.FC<{
                 onClick={handleDecrypt} 
                 disabled={isDecrypting}
               >
-                {isDecrypting ? "Decrypting..." : 
-                 form.isVerified ? "✅ Verified" : 
-                 decryptedValue !== null ? "🔄 Re-verify" : 
-                 "🔓 Decrypt"}
+                {isDecrypting ? (
+                  "🔓 Verifying..."
+                ) : form.isVerified ? (
+                  "✅ Verified"
+                ) : decryptedValue !== null ? (
+                  "🔄 Re-verify"
+                ) : (
+                  "🔓 Verify Decryption"
+                )}
               </button>
             </div>
             
-            <div className="public-data">
-              <div className="public-item">
-                <span>Public Value 1:</span>
-                <strong>{form.publicValue1}</strong>
-              </div>
-              <div className="public-item">
-                <span>Public Value 2:</span>
-                <strong>{form.publicValue2}</strong>
+            <div className="fhe-info">
+              <div className="fhe-icon">🔐</div>
+              <div>
+                <strong>FHE Self-Relaying Decryption</strong>
+                <p>Data is encrypted on-chain. Click "Verify Decryption" to perform offline decryption and on-chain verification.</p>
               </div>
             </div>
           </div>
+          
+          {(form.isVerified || decryptedValue !== null) && (
+            <div className="analysis-section">
+              <h3>Data Analysis</h3>
+              <div className="value-display">
+                <div className="value-item">
+                  <span>Encrypted Value:</span>
+                  <strong>
+                    {form.isVerified ? 
+                      `${form.decryptedValue} (On-chain Verified)` : 
+                      `${decryptedValue} (Locally Decrypted)`
+                    }
+                  </strong>
+                  <span className={`data-badge ${form.isVerified ? 'verified' : 'local'}`}>
+                    {form.isVerified ? 'On-chain Verified' : 'Local Decryption'}
+                  </span>
+                </div>
+                <div className="value-item">
+                  <span>Public Reference:</span>
+                  <strong>{form.publicValue1}</strong>
+                  <span className="data-badge public">Public Data</span>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
         
         <div className="modal-footer">
           <button onClick={onClose} className="close-btn">Close</button>
+          {!form.isVerified && (
+            <button 
+              onClick={handleDecrypt} 
+              disabled={isDecrypting}
+              className="verify-btn"
+            >
+              {isDecrypting ? "Verifying on-chain..." : "Verify on-chain"}
+            </button>
+          )}
         </div>
       </div>
     </div>
